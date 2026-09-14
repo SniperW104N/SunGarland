@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+f#!/usr/bin/env python3
 """
 WhatsApp Market - Backend API
 Supports SQLite (local) and PostgreSQL (production).
@@ -2552,7 +2552,7 @@ def admin_delete_property(prop_id):
 
 # ---------- Houses & Hostels ----------
 @app.route("/api/properties", methods=["GET"])
-def get_property():
+def get_properties():
     prop_type = request.args.get("type")  # house, hostel, or all
     search = request.args.get("search", "").strip()
     location = request.args.get("location", "").strip()
@@ -2579,7 +2579,7 @@ def get_property():
 
 
 @app.route("/api/properties/<int:prop_id>", methods=["GET"])
-def fetch_property_details(prop_id):
+def get_property(prop_id):
     row = execute("SELECT * FROM properties WHERE id = ?", (prop_id,), fetchone=True)
     if not row:
         return jsonify({"error": "Property not found"}), 404
