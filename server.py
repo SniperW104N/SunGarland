@@ -44,9 +44,9 @@ if REQUIRE_POSTGRES and not USE_POSTGRES:
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "mp4", "webm", "mov", "ogg", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB max (for videos)
 
+app = Flask(__name__)
 CORS(app, supports_credentials=True)
 
 # ---------- Database helpers ----------
@@ -2579,7 +2579,7 @@ def get_properties():
 
 
 @app.route("/api/properties/<int:prop_id>", methods=["GET"])
-def get_single_property(prop_id):
+def get_property(prop_id):
     row = execute("SELECT * FROM properties WHERE id = ?", (prop_id,), fetchone=True)
     if not row:
         return jsonify({"error": "Property not found"}), 404
