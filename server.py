@@ -2552,7 +2552,7 @@ def admin_delete_property(prop_id):
 
 # ---------- Houses & Hostels ----------
 @app.route("/api/properties", methods=["GET"])
-def get_properties():
+def get_single_properties(prop_id):
     prop_type = request.args.get("type")  # house, hostel, or all
     search = request.args.get("search", "").strip()
     location = request.args.get("location", "").strip()
