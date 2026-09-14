@@ -1,4 +1,4 @@
-f#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 WhatsApp Market - Backend API
 Supports SQLite (local) and PostgreSQL (production).
@@ -44,9 +44,9 @@ if REQUIRE_POSTGRES and not USE_POSTGRES:
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "mp4", "webm", "mov", "ogg", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB max (for videos)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB max (for videos)
 CORS(app, supports_credentials=True)
 
 # ---------- Database helpers ----------
