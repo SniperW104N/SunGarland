@@ -2612,111 +2612,20 @@ def get_properties():
 
 @app.route("/api/properties", methods=["POST"])
 @login_required
-def create_property():
-    """Agents (logged-in sellers) can list houses/hostels. No payment required for listing properties."""
-    seller_check = execute(
-        "SELECT is_blocked, shop_name, whatsapp, agent_status FROM sellers WHERE id = ?",
-        (g.seller_id,), fetchone=True
-    )
-    if seller_check and seller_check.get("is_blocked"):
-        return jsonify({"error": "Your account has been blocked."}), 403
-    if not seller_check or seller_check.get("agent_status") != "approved":
-        return jsonify({
-            "error": "You must submit a government-registered agent document and get admin approval before listing houses or hostels."
-        }), 403
-
-    data = request.get_json(silent=True) or {}
-    required = ["title", "property_type", "location", "price", "description"]
-    missing = [f for f in required if not data.get(f) and data.get(f) != 0]
-    if missing:
-        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
-
-    try:
-        price = float(data["price"])
-        if price < 0:
-            raise ValueError()
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid price"}), 400
-
-    prop_type = str(data["property_type"]).strip().lower()
-    if prop_type not in ("house", "hostel", "apartment", "room"):
-        prop_type = "house"
-
-    agent_name = data.get("agent_name") or (seller_check["shop_name"] if seller_check else "Agent")
-    whatsapp = data.get("whatsapp") or (seller_check["whatsapp"] if seller_check else "")
-    if not whatsapp:
-        return jsonify({"error": "WhatsApp number is required"}), 400
-
-    now = datetime.now(timezone.utc).isoformat()
-    image = data.get("image") or None
-    price_period = data.get("price_period") or "month"
-
-    if USE_POSTGRES:
-        execute(
-            """INSERT INTO properties
-               (title, property_type, location, price, price_period, description, image, agent_name, whatsapp, seller_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (data["title"].strip(), prop_type, data["location"].strip(), price, price_period,
-             data["description"].strip(), image, agent_name, str(whatsapp).strip(), g.seller_id, now),
-            commit=True,
-        )
-        row = execute("SELECT * FROM properties ORDER BY id DESC LIMIT 1", fetchone=True)
-    else:
-        cur = execute(
-            """INSERT INTO properties
-               (title, property_type, location, price, price_period, description, image, agent_name, whatsapp, seller_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (data["title"].strip(), prop_type, data["location"].strip(), price, price_period,
-             data["description"].strip(), image, agent_name, str(whatsapp).strip(), g.seller_id, now),
-            commit=True,
-        )
-        row = execute("SELECT * FROM properties WHERE id = ?", (cur.lastrowid,), fetchone=True)
-
-    return jsonify(row), 201
 
 
 @app.route("/api/my/properties", methods=["GET"])
 @login_required
-def my_properties():
-    rows = execute(
-        "SELECT * FROM properties WHERE seller_id = ? ORDER BY created_at DESC",
-        (g.seller_id,), fetchall=True
-    )
-    return jsonify(rows or [])
 
 
 @app.route("/api/my/properties/<int:prop_id>", methods=["DELETE"])
 @login_required
-def delete_my_property(prop_id):
-    prop = execute("SELECT * FROM properties WHERE id = ?", (prop_id,), fetchone=True)
-    if not prop:
-        return jsonify({"error": "Not found"}), 404
-    if prop.get("seller_id") != g.seller_id:
-        return jsonify({"error": "Not your listing"}), 403
-    execute("DELETE FROM properties WHERE id = ?", (prop_id,), commit=True)
-    return jsonify({"message": "Deleted"})
 
 
 @app.route("/api/admin/properties", methods=["GET"])
-def admin_properties():
-    admin_key = request.headers.get("X-Admin-Key") or request.args.get("key")
-    if not admin_key or admin_key != ADMIN_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
-    rows = execute("SELECT * FROM properties ORDER BY created_at DESC", fetchall=True)
-    return jsonify(rows or [])
 
 
 @app.route("/api/admin/properties/<int:prop_id>", methods=["DELETE"])
-def admin_delete_property(prop_id):
-    admin_key = request.headers.get("X-Admin-Key") or request.args.get("key")
-    if not admin_key or admin_key != ADMIN_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
-    execute("DELETE FROM properties WHERE id = ?", (prop_id,), commit=True)
-    return jsonify({"message": "Deleted"})
-
-
-
-# ---------- Agent verification (Houses & Hostels) ----------
 @app.route("/api/agent/submit", methods=["POST"])
 @login_required
 def submit_agent_docs():
@@ -3051,42 +2960,6 @@ def push_unsubscribe():
 
 @app.route("/api/kyc/face-match-result", methods=["POST"])
 @login_required
-def kyc_face_match_result():
-    """Store client-side face-api.js match score with the seller KYC record."""
-    data = request.get_json(silent=True) or {}
-    score = data.get("match_score")  # 0-1
-    label = data.get("label") or "unknown"
-    try:
-        score_f = float(score) if score is not None else None
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid score"}), 400
-
-    # Store in bio field prefix or agent field - use a dedicated note via notification + seller bio append
-    # Better: store in verification via updating a JSON-ish note on seller - use full_name_profile? 
-    # Use agent_license temporary no - add column via try alter
-    try:
-        if USE_POSTGRES:
-            execute("ALTER TABLE sellers ADD COLUMN IF NOT EXISTS face_match_score REAL", commit=True)
-            execute("ALTER TABLE sellers ADD COLUMN IF NOT EXISTS face_match_label TEXT", commit=True)
-        else:
-            cols = execute("PRAGMA table_info(sellers)", fetchall=True)
-            names = [c["name"] for c in (cols or [])]
-            if "face_match_score" not in names:
-                execute("ALTER TABLE sellers ADD COLUMN face_match_score REAL", commit=True)
-            if "face_match_label" not in names:
-                execute("ALTER TABLE sellers ADD COLUMN face_match_label TEXT", commit=True)
-    except Exception as e:
-        print(f"face_match cols: {e}")
-
-    execute(
-        "UPDATE sellers SET face_match_score = ?, face_match_label = ? WHERE id = ?",
-        (score_f, label, g.seller_id), commit=True
-    )
-    return jsonify({"message": "Face match result saved", "match_score": score_f, "label": label})
-
-
-
-# ---------- Reports / Disputes ----------
 @app.route("/api/reports", methods=["POST"])
 def create_report():
     data = request.get_json(silent=True) or {}
