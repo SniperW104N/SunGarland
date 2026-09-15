@@ -21,30 +21,61 @@ import uuid
 from flask_cors import CORS
 
 # ---------- Configuration ----------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_URL = os.environ.get("DATABASE_URL")  # e.g. postgres://user:pass@host/db
-SQLITE_PATH = os.path.join(BASE_DIR, "marketplace.db")
-PORT = int(os.environ.get("PORT", 5000))
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-secret-in-production-please")
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "sungarland-admin-2026")
+from pathlib import Path
 
-# Web Push (VAPID) — set VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_MAILTO in production
+class Config:
+    """Base configuration"""
+    BASE_DIR = Path(__file__).parent.absolute()
+    UPLOAD_FOLDER = BASE_DIR / "uploads"
+    
+    # Core settings
+    PORT = int(os.environ.get("PORT", 5000))
+    JWT_EXPIRE_HOURS = 72
+    
+    # Database
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+    SQLITE_PATH = BASE_DIR / "marketplace.db"
+    USE_POSTGRES = bool(DATABASE_URL)
+    REQUIRE_POSTGRES = os.environ.get("REQUIRE_POSTGRES", "0") == "1"
+    if REQUIRE_POSTGRES and not USE_POSTGRES:
+        raise SystemExit(
+            "REQUIRE_POSTGRES=1 but DATABASE_URL is not set. "
+            "Attach Railway PostgreSQL and set DATABASE_URL, or remove REQUIRE_POSTGRES."
+        )
+    
+    # Allowed file extensions
+    ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "mp4", "webm", "mov", "ogg", "pdf"}
+
+# Load configuration
+config = Config()
+
+# Database configuration (for compatibility)
+BASE_DIR = str(config.BASE_DIR)
+PORT = config.PORT
+JWT_EXPIRE_HOURS = config.JWT_EXPIRE_HOURS
+DATABASE_URL = config.DATABASE_URL
+SQLITE_PATH = str(config.SQLITE_PATH)
+USE_POSTGRES = config.USE_POSTGRES
+REQUIRE_POSTGRES = config.REQUIRE_POSTGRES
+UPLOAD_FOLDER = str(config.UPLOAD_FOLDER)
+ALLOWED_EXTENSIONS = config.ALLOWED_EXTENSIONS
+
+# Secrets (MUST come from environment variables—no defaults)
+JWT_SECRET = os.environ.get("JWT_SECRET")
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_MAILTO = os.environ.get("VAPID_MAILTO", "mailto:admin@sungarland.com")
 
-JWT_EXPIRE_HOURS = 72
-USE_POSTGRES = bool(DATABASE_URL)
-REQUIRE_POSTGRES = os.environ.get("REQUIRE_POSTGRES", "0") == "1"
-if REQUIRE_POSTGRES and not USE_POSTGRES:
-    raise SystemExit(
-        "REQUIRE_POSTGRES=1 but DATABASE_URL is not set. "
-        "Attach Railway PostgreSQL and set DATABASE_URL, or remove REQUIRE_POSTGRES."
-    )
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "mp4", "webm", "mov", "ogg", "pdf"}
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# Validate production environment
+if os.environ.get("FLASK_ENV") == "production":
+    required_env_vars = ["JWT_SECRET", "ADMIN_SECRET"]
+    missing = [var for var in required_env_vars if not os.environ.get(var)]
+    if missing:
+        raise SystemExit(f"Production mode: Missing required environment variables: {', '.join(missing)}")
 
+# Initialize upload folder
+config.UPLOAD_FOLDER.mkdir(exist_ok=True)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB max (for videos)
 CORS(app, supports_credentials=True)
