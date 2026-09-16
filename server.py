@@ -22,12 +22,13 @@ from flask_cors import CORS
 
 # ---------- Configuration ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL")  # e.g. postgres://user:pass@host/db
 SQLITE_PATH = os.path.join(BASE_DIR, "marketplace.db")
 PORT = int(os.environ.get("PORT", 5000))
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-secret-in-production-please")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "sungarland-admin-2026")
 
+# Web Push (VAPID) — set VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_MAILTO in production
 VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_MAILTO = os.environ.get("VAPID_MAILTO", "mailto:admin@sungarland.com")
@@ -35,12 +36,13 @@ VAPID_MAILTO = os.environ.get("VAPID_MAILTO", "mailto:admin@sungarland.com")
 JWT_EXPIRE_HOURS = 72
 USE_POSTGRES = bool(DATABASE_URL)
 REQUIRE_POSTGRES = os.environ.get("REQUIRE_POSTGRES", "0") == "1"
+# Do not hard-crash the process: log a clear warning so Railway still starts
+# and /api/health can report the problem. Set DATABASE_URL for real Postgres.
 if REQUIRE_POSTGRES and not USE_POSTGRES:
-    raise SystemExit(
-        "REQUIRE_POSTGRES=1 but DATABASE_URL is not set. "
-        "Attach Railway PostgreSQL and set DATABASE_URL, or remove REQUIRE_POSTGRES."
+    print(
+        "WARNING: REQUIRE_POSTGRES=1 but DATABASE_URL is not set. "
+        "Falling back to SQLite. Attach Railway PostgreSQL and set DATABASE_URL."
     )
-
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "mp4", "webm", "mov", "ogg", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -2579,7 +2581,7 @@ def get_properties():
 
 
 @app.route("/api/properties/<int:prop_id>", methods=["GET"])
-def get_property_main(prop_id):
+def get_property(prop_id):
     row = execute("SELECT * FROM properties WHERE id = ?", (prop_id,), fetchone=True)
     if not row:
         return jsonify({"error": "Property not found"}), 404
@@ -2967,20 +2969,42 @@ def kyc_face_check():
 
 
 @app.route("/api/kyc/face-match", methods=["POST"])
+@app.route("/api/kyc/face-match-result", methods=["POST"])
 @login_required
 def kyc_face_match_result():
+    """Store client-side face-api.js match score with the seller KYC record."""
     data = request.get_json(silent=True) or {}
-    score = data.get("face_match_score")
-    label = data.get("face_match_label")
+    score = data.get("match_score", data.get("face_match_score"))
+    label = data.get("label") or data.get("face_match_label") or "unknown"
     try:
-        score = float(score) if score is not None else None
+        score_f = float(score) if score is not None else None
     except (TypeError, ValueError):
-        score = None
+        return jsonify({"error": "Invalid score"}), 400
+
+    try:
+        if USE_POSTGRES:
+            execute("ALTER TABLE sellers ADD COLUMN IF NOT EXISTS face_match_score REAL", commit=True)
+            execute("ALTER TABLE sellers ADD COLUMN IF NOT EXISTS face_match_label TEXT", commit=True)
+        else:
+            cols = execute("PRAGMA table_info(sellers)", fetchall=True)
+            names = [c["name"] for c in (cols or [])]
+            if "face_match_score" not in names:
+                execute("ALTER TABLE sellers ADD COLUMN face_match_score REAL", commit=True)
+            if "face_match_label" not in names:
+                execute("ALTER TABLE sellers ADD COLUMN face_match_label TEXT", commit=True)
+    except Exception as e:
+        print(f"face_match cols: {e}")
+
     execute(
         "UPDATE sellers SET face_match_score = ?, face_match_label = ? WHERE id = ?",
-        (score, label, g.seller_id), commit=True
+        (score_f, label, g.seller_id), commit=True
     )
-    return jsonify({"message": "Face match stored", "face_match_score": score, "face_match_label": label})
+    return jsonify({
+        "message": "Face match result saved",
+        "match_score": score_f,
+        "face_match_score": score_f,
+        "label": label,
+    })
 
 
 # ---------- Web Push ----------
@@ -3023,42 +3047,6 @@ def push_unsubscribe():
     if endpoint:
         execute("DELETE FROM push_subscriptions WHERE endpoint = ? AND seller_id = ?", (endpoint, g.seller_id), commit=True)
     return jsonify({"message": "Unsubscribed"})
-
-
-@app.route("/api/kyc/face-match-result", methods=["POST"])
-@login_required
-def kyc_face_match_result():
-    """Store client-side face-api.js match score with the seller KYC record."""
-    data = request.get_json(silent=True) or {}
-    score = data.get("match_score")  # 0-1
-    label = data.get("label") or "unknown"
-    try:
-        score_f = float(score) if score is not None else None
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid score"}), 400
-
-    # Store in bio field prefix or agent field - use a dedicated note via notification + seller bio append
-    # Better: store in verification via updating a JSON-ish note on seller - use full_name_profile? 
-    # Use agent_license temporary no - add column via try alter
-    try:
-        if USE_POSTGRES:
-            execute("ALTER TABLE sellers ADD COLUMN IF NOT EXISTS face_match_score REAL", commit=True)
-            execute("ALTER TABLE sellers ADD COLUMN IF NOT EXISTS face_match_label TEXT", commit=True)
-        else:
-            cols = execute("PRAGMA table_info(sellers)", fetchall=True)
-            names = [c["name"] for c in (cols or [])]
-            if "face_match_score" not in names:
-                execute("ALTER TABLE sellers ADD COLUMN face_match_score REAL", commit=True)
-            if "face_match_label" not in names:
-                execute("ALTER TABLE sellers ADD COLUMN face_match_label TEXT", commit=True)
-    except Exception as e:
-        print(f"face_match cols: {e}")
-
-    execute(
-        "UPDATE sellers SET face_match_score = ?, face_match_label = ? WHERE id = ?",
-        (score_f, label, g.seller_id), commit=True
-    )
-    return jsonify({"message": "Face match result saved", "match_score": score_f, "label": label})
 
 
 
