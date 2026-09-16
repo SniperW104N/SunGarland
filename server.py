@@ -2579,7 +2579,7 @@ def get_properties():
 
 
 @app.route("/api/properties/<int:prop_id>", methods=["GET"])
-def get_property_main(prop_id):   # <-- change here
+def get_property_main(prop_id):
     row = execute("SELECT * FROM properties WHERE id = ?", (prop_id,), fetchone=True)
     if not row:
         return jsonify({"error": "Property not found"}), 404
