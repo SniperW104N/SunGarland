@@ -1406,35 +1406,54 @@ def create_product():
     video_url = data.get("video_url") or None
     now = datetime.now(timezone.utc).isoformat()
 
-    if USE_POSTGRES:
-        execute(
-            """INSERT INTO products
-               (name, price, category, description, seller, whatsapp, image, video_url, seller_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                data["name"].strip(), price, data["category"].strip(),
-                data["description"].strip(), seller["shop_name"], seller["whatsapp"],
-                image, g.seller_id, now,
-            ),
-            commit=True,
-        )
-        row = execute(
-            "SELECT * FROM products WHERE seller_id = ? ORDER BY id DESC LIMIT 1",
-            (g.seller_id,), fetchone=True,
-        )
-    else:
-        cur = execute(
-            """INSERT INTO products
-               (name, price, category, description, seller, whatsapp, image, video_url, seller_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                data["name"].strip(), price, data["category"].strip(),
-                data["description"].strip(), seller["shop_name"], seller["whatsapp"],
-                image, g.seller_id, now,
-            ),
-            commit=True,
-        )
-        row = execute("SELECT * FROM products WHERE id = ?", (cur.lastrowid,), fetchone=True)
+    try:
+        if USE_POSTGRES:
+            execute(
+                """INSERT INTO products
+                   (name, price, category, description, seller, whatsapp, image, video_url, seller_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    data["name"].strip(),
+                    price,
+                    data["category"].strip(),
+                    data["description"].strip(),
+                    seller["shop_name"],
+                    seller["whatsapp"],
+                    image,
+                    video_url,
+                    g.seller_id,
+                    now,
+                ),
+                commit=True,
+            )
+            row = execute(
+                "SELECT * FROM products WHERE seller_id = ? ORDER BY id DESC LIMIT 1",
+                (g.seller_id,),
+                fetchone=True,
+            )
+        else:
+            cur = execute(
+                """INSERT INTO products
+                   (name, price, category, description, seller, whatsapp, image, video_url, seller_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    data["name"].strip(),
+                    price,
+                    data["category"].strip(),
+                    data["description"].strip(),
+                    seller["shop_name"],
+                    seller["whatsapp"],
+                    image,
+                    video_url,
+                    g.seller_id,
+                    now,
+                ),
+                commit=True,
+            )
+            row = execute("SELECT * FROM products WHERE id = ?", (cur.lastrowid,), fetchone=True)
+    except Exception as e:
+        print(f"create_product error: {e}")
+        return jsonify({"error": f"Could not save product: {e}"}), 500
 
     return jsonify(row), 201
 
