@@ -49,7 +49,13 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB max (for videos)
-CORS(app, supports_credentials=True)
+CORS(
+    app,
+    supports_credentials=True,
+    resources={r"/api/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "Authorization", "X-Admin-Key"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+)
 
 # ---------- Database helpers ----------
 def get_db():
@@ -1618,39 +1624,98 @@ def buyer_verify():
 
 
 # ---------- Admin KYC management ----------
+def _admin_authorized():
+    """True if request carries a valid admin key (header or ?key=)."""
+    secret = (ADMIN_SECRET or "").strip()
+    if not secret:
+        return False
+    key = (request.headers.get("X-Admin-Key") or request.args.get("key") or "").strip()
+    return bool(key) and key == secret
+
+
+def _ensure_face_match_columns():
+    """Add face_match columns if missing (safe for Postgres + SQLite)."""
+    try:
+        if USE_POSTGRES:
+            execute("ALTER TABLE sellers ADD COLUMN IF NOT EXISTS face_match_score REAL", commit=True)
+            execute("ALTER TABLE sellers ADD COLUMN IF NOT EXISTS face_match_label TEXT", commit=True)
+        else:
+            cols = execute("PRAGMA table_info(sellers)", fetchall=True) or []
+            names = [c["name"] for c in cols]
+            if "face_match_score" not in names:
+                execute("ALTER TABLE sellers ADD COLUMN face_match_score REAL", commit=True)
+            if "face_match_label" not in names:
+                execute("ALTER TABLE sellers ADD COLUMN face_match_label TEXT", commit=True)
+    except Exception as e:
+        print(f"face_match column ensure: {e}")
+
+
 @app.route("/api/admin/kyc/pending", methods=["GET"])
 def admin_pending_kyc():
-    admin_key = request.headers.get("X-Admin-Key") or request.args.get("key")
-    if not admin_key or admin_key != ADMIN_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
+    if not _admin_authorized():
+        return jsonify({
+            "error": "Unauthorized",
+            "hint": "Use the same password as Railway variable ADMIN_SECRET",
+        }), 401
 
-    sellers = execute(
-        """SELECT id, username, email, shop_name, whatsapp, full_name, id_number, address,
-                  id_document_url, selfie_url, kyc_status, kyc_submitted_at, created_at,
-                  face_match_score, face_match_label
-           FROM sellers WHERE kyc_status = 'pending' ORDER BY kyc_submitted_at DESC""",
-        fetchall=True,
-    )
+    _ensure_face_match_columns()
+
+    try:
+        sellers = execute(
+            """SELECT id, username, email, shop_name, whatsapp, full_name, id_number, address,
+                      id_document_url, selfie_url, kyc_status, kyc_submitted_at, created_at,
+                      face_match_score, face_match_label
+               FROM sellers WHERE kyc_status = 'pending' ORDER BY kyc_submitted_at DESC""",
+            fetchall=True,
+        )
+    except Exception:
+        try:
+            sellers = execute(
+                """SELECT id, username, email, shop_name, whatsapp, full_name, id_number, address,
+                          id_document_url, selfie_url, kyc_status, kyc_submitted_at, created_at
+                   FROM sellers WHERE kyc_status = 'pending' ORDER BY kyc_submitted_at DESC""",
+                fetchall=True,
+            )
+        except Exception as e2:
+            print(f"admin_pending_kyc error: {e2}")
+            return jsonify({"error": f"Database error: {e2}"}), 500
+
     return jsonify(sellers or [])
 
 
 @app.route("/api/admin/kyc/<int:seller_id>/approve", methods=["POST"])
 def admin_approve_kyc(seller_id):
-    admin_key = request.headers.get("X-Admin-Key") or request.args.get("key")
-    if not admin_key or admin_key != ADMIN_SECRET:
+    if not _admin_authorized():
         return jsonify({"error": "Unauthorized"}), 401
 
     execute("UPDATE sellers SET kyc_status = 'approved' WHERE id = ?", (seller_id,), commit=True)
+    try:
+        create_notification(
+            seller_id,
+            "KYC Approved",
+            "Your identity verification was approved. You can list products.",
+            "kyc",
+        )
+    except Exception:
+        pass
     return jsonify({"message": "KYC approved", "id": seller_id})
 
 
 @app.route("/api/admin/kyc/<int:seller_id>/reject", methods=["POST"])
 def admin_reject_kyc(seller_id):
-    admin_key = request.headers.get("X-Admin-Key") or request.args.get("key")
-    if not admin_key or admin_key != ADMIN_SECRET:
+    if not _admin_authorized():
         return jsonify({"error": "Unauthorized"}), 401
 
     execute("UPDATE sellers SET kyc_status = 'rejected' WHERE id = ?", (seller_id,), commit=True)
+    try:
+        create_notification(
+            seller_id,
+            "KYC Rejected",
+            "Your identity verification was rejected. Please resubmit clearer documents.",
+            "kyc",
+        )
+    except Exception:
+        pass
     return jsonify({"message": "KYC rejected", "id": seller_id})
 
 
