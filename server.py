@@ -149,6 +149,17 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """, commit=True)
+        execute("""
+            CREATE TABLE IF NOT EXISTS buyers (
+                id SERIAL PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                email TEXT,
+                phone TEXT,
+                selfie_url TEXT,
+                kyc_status TEXT DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )
+        """, commit=True)
     else:
         execute("""
             CREATE TABLE IF NOT EXISTS sellers (
@@ -1609,42 +1620,74 @@ def buyer_verify():
         return jsonify({"error": "Full name is required"}), 400
 
     selfie_url = data.get("selfie_url") or None
-    email = data.get("email") or None
-    phone = data.get("phone") or None
+    email = (data.get("email") or "").strip() or None
+    phone = (data.get("phone") or "").strip() or None
     now = datetime.now(timezone.utc).isoformat()
 
-    # For demo we auto-approve buyers (can be changed to pending)
-    if USE_POSTGRES:
-        execute(
-            """INSERT INTO buyers (full_name, email, phone, selfie_url, kyc_status, created_at)
-               VALUES (?, ?, ?, ?, 'approved', ?)""",
-            (full_name, email, phone, selfie_url, now),
-            commit=True,
-        )
-        row = execute("SELECT id FROM buyers ORDER BY id DESC LIMIT 1", fetchone=True)
-        buyer_id = row["id"]
-    else:
-        cur = execute(
-            """INSERT INTO buyers (full_name, email, phone, selfie_url, kyc_status, created_at)
-               VALUES (?, ?, ?, ?, 'approved', ?)""",
-            (full_name, email, phone, selfie_url, now),
-            commit=True,
-        )
-        buyer_id = cur.lastrowid
+    # Ensure buyers table exists (was missing on Postgres in older deploys)
+    try:
+        if USE_POSTGRES:
+            execute("""
+                CREATE TABLE IF NOT EXISTS buyers (
+                    id SERIAL PRIMARY KEY,
+                    full_name TEXT NOT NULL,
+                    email TEXT,
+                    phone TEXT,
+                    selfie_url TEXT,
+                    kyc_status TEXT DEFAULT 'pending',
+                    created_at TEXT NOT NULL
+                )
+            """, commit=True)
+        else:
+            execute("""
+                CREATE TABLE IF NOT EXISTS buyers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    full_name TEXT NOT NULL,
+                    email TEXT,
+                    phone TEXT,
+                    selfie_url TEXT,
+                    kyc_status TEXT DEFAULT 'pending',
+                    created_at TEXT NOT NULL
+                )
+            """, commit=True)
+    except Exception as e:
+        print(f"buyers table ensure: {e}")
 
-    # Create a simple token for the buyer
-    token = create_token(buyer_id, full_name)  # reuse JWT helper
-    return jsonify({
-        "message": "Verification successful",
-        "buyer_token": token,
-        "buyer_id": buyer_id,
-        "full_name": full_name
-    })
+    try:
+        if USE_POSTGRES:
+            execute(
+                """INSERT INTO buyers (full_name, email, phone, selfie_url, kyc_status, created_at)
+                   VALUES (?, ?, ?, ?, 'approved', ?)""",
+                (full_name, email, phone, selfie_url, now),
+                commit=True,
+            )
+            row = execute("SELECT id FROM buyers ORDER BY id DESC LIMIT 1", fetchone=True)
+            if not row:
+                return jsonify({"error": "Failed to create buyer record"}), 500
+            buyer_id = row["id"]
+        else:
+            cur = execute(
+                """INSERT INTO buyers (full_name, email, phone, selfie_url, kyc_status, created_at)
+                   VALUES (?, ?, ?, ?, 'approved', ?)""",
+                (full_name, email, phone, selfie_url, now),
+                commit=True,
+            )
+            buyer_id = cur.lastrowid
+
+        token = create_token(buyer_id, full_name)
+        return jsonify({
+            "message": "Verification successful",
+            "buyer_token": token,
+            "buyer_id": buyer_id,
+            "full_name": full_name,
+        })
+    except Exception as e:
+        print(f"buyer_verify error: {e}")
+        return jsonify({"error": f"Verification failed: {e}"}), 500
 
 
 # ---------- Admin KYC management ----------
 def _admin_authorized():
-    """True if request carries a valid admin key (header or ?key=)."""
     secret = (ADMIN_SECRET or "").strip()
     if not secret:
         return False
@@ -1653,7 +1696,6 @@ def _admin_authorized():
 
 
 def _ensure_face_match_columns():
-    """Add face_match columns if missing (safe for Postgres + SQLite)."""
     try:
         if USE_POSTGRES:
             execute("ALTER TABLE sellers ADD COLUMN IF NOT EXISTS face_match_score REAL", commit=True)
