@@ -1,5 +1,6 @@
 flask>=3.0
 flask-cors>=4.0
+gunicorn
 PyJWT>=2.8
 psycopg2-binary>=2.9
 requests>=2.28
