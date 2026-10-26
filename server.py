@@ -57,6 +57,18 @@ CORS(
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
 
+_db_initialized = False
+
+@app.before_request
+def ensure_db_initialized():
+    global _db_initialized
+    if not _db_initialized:
+        try:
+            init_db()
+            _db_initialized = True
+        except Exception as _e:
+            print(f"[ENSURE-DB-WARN] {_e}")
+
 # ---------- Database helpers ----------
 def get_db():
     if "db" not in g:
@@ -90,25 +102,39 @@ def execute(query, params=None, fetchone=False, fetchall=False, commit=False):
         import psycopg2.extras
         cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         pg_query = query.replace("?", "%s")
-        cur.execute(pg_query, params)
-        if commit:
-            db.commit()
-        if fetchone:
-            row = cur.fetchone()
-            return dict(row) if row else None
-        if fetchall:
-            return [dict(r) for r in cur.fetchall()]
-        return cur
+        try:
+            cur.execute(pg_query, params)
+            if commit:
+                db.commit()
+            if fetchone:
+                row = cur.fetchone()
+                return dict(row) if row else None
+            if fetchall:
+                return [dict(r) for r in cur.fetchall()]
+            return cur
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            raise e
     else:
-        cur = db.execute(query, params)
-        if commit:
-            db.commit()
-        if fetchone:
-            row = cur.fetchone()
-            return dict(row) if row else None
-        if fetchall:
-            return [dict(r) for r in cur.fetchall()]
-        return cur
+        try:
+            cur = db.execute(query, params)
+            if commit:
+                db.commit()
+            if fetchone:
+                row = cur.fetchone()
+                return dict(row) if row else None
+            if fetchall:
+                return [dict(r) for r in cur.fetchall()]
+            return cur
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            raise e
 
 
 def init_db():
@@ -1369,18 +1395,29 @@ def login():
 @app.route("/api/auth/me", methods=["GET"])
 @login_required
 def me():
-    seller = execute(
-        """SELECT id, username, email, shop_name, whatsapp, subscription_expires_at, kyc_status,
-                  email_verified, phone_verified, full_name_profile, bio, profile_image, created_at
-           FROM sellers WHERE id = ?""",
-        (g.seller_id,),
-        fetchone=True,
-    )
+    seller = None
+    try:
+        seller = execute(
+            """SELECT id, username, email, shop_name, whatsapp, subscription_expires_at, kyc_status,
+                      email_verified, phone_verified, full_name_profile, bio, profile_image, created_at
+               FROM sellers WHERE id = ?""",
+            (g.seller_id,),
+            fetchone=True,
+        )
+    except Exception:
+        # Fallback if phone_verified column migration was pending
+        seller = execute(
+            """SELECT id, username, email, shop_name, whatsapp, subscription_expires_at, kyc_status,
+                      email_verified, full_name_profile, bio, profile_image, created_at
+               FROM sellers WHERE id = ?""",
+            (g.seller_id,),
+            fetchone=True,
+        )
     if not seller:
         return jsonify({"error": "Seller not found"}), 404
     result = dict(seller)
     result["email_verified"] = bool(result.get("email_verified"))
-    result["phone_verified"] = bool(result.get("phone_verified"))
+    result["phone_verified"] = bool(result.get("phone_verified", 0))
     return jsonify(result)
 
 
@@ -1843,32 +1880,48 @@ def get_seller_followers(seller_id):
 @login_required
 def get_my_following():
     """List of sellers the current logged-in user is following."""
-    rows = execute(
-        """SELECT s.id, s.username, s.shop_name, s.whatsapp, s.profile_image, s.kyc_status, f.created_at
-           FROM follows f
-           JOIN sellers s ON s.id = f.seller_id
-           WHERE f.follower_id = ?
-           ORDER BY f.created_at DESC""",
-        (g.seller_id,), fetchall=True
-    ) or []
-    return jsonify(rows)
+    try:
+        rows = execute(
+            """SELECT s.id, s.username, s.shop_name, s.whatsapp, s.profile_image, s.kyc_status, f.created_at
+               FROM follows f
+               JOIN sellers s ON s.id = f.seller_id
+               WHERE f.follower_id = ?
+               ORDER BY f.created_at DESC""",
+            (g.seller_id,), fetchall=True
+        ) or []
+        return jsonify(rows)
+    except Exception as e:
+        print(f"[MY-FOLLOWING-RECOVER] {e}")
+        try:
+            init_db()
+        except Exception:
+            pass
+        return jsonify([])
 
 
 @app.route("/api/feed/following", methods=["GET"])
 @login_required
 def get_following_feed():
     """Returns product feed exclusively from sellers the user follows."""
-    rows = execute(
-        """SELECT p.*, s.shop_name as seller_shop, s.username as seller_username
-           FROM products p
-           JOIN follows f ON f.seller_id = p.seller_id
-           JOIN sellers s ON s.id = p.seller_id
-           WHERE f.follower_id = ?
-           ORDER BY p.created_at DESC
-           LIMIT 50""",
-        (g.seller_id,), fetchall=True
-    ) or []
-    return jsonify(rows)
+    try:
+        rows = execute(
+            """SELECT p.*, s.shop_name as seller_shop, s.username as seller_username
+               FROM products p
+               JOIN follows f ON f.seller_id = p.seller_id
+               JOIN sellers s ON s.id = p.seller_id
+               WHERE f.follower_id = ?
+               ORDER BY p.created_at DESC
+               LIMIT 50""",
+            (g.seller_id,), fetchall=True
+        ) or []
+        return jsonify(rows)
+    except Exception as e:
+        print(f"[FEED-FOLLOWING-RECOVER] {e}")
+        try:
+            init_db()
+        except Exception:
+            pass
+        return jsonify([])
 
 
 # ---------- Favorites / Wishlist System ----------
@@ -1884,61 +1937,80 @@ def toggle_favorite():
     except (TypeError, ValueError):
         return jsonify({"error": "Valid item_id required"}), 400
 
-    existing = execute(
-        "SELECT id FROM favorites WHERE user_id = ? AND item_type = ? AND item_id = ?",
-        (g.seller_id, item_type, item_id), fetchone=True
-    )
-    if existing:
-        execute("DELETE FROM favorites WHERE id = ?", (existing["id"],), commit=True)
-        saved = False
-    else:
-        now = datetime.now(timezone.utc).isoformat()
-        execute(
-            "INSERT INTO favorites (user_id, item_type, item_id, created_at) VALUES (?, ?, ?, ?)",
-            (g.seller_id, item_type, item_id, now), commit=True
+    try:
+        existing = execute(
+            "SELECT id FROM favorites WHERE user_id = ? AND item_type = ? AND item_id = ?",
+            (g.seller_id, item_type, item_id), fetchone=True
         )
-        saved = True
-
-    return jsonify({"success": True, "saved": saved, "item_type": item_type, "item_id": item_id})
+        if existing:
+            execute("DELETE FROM favorites WHERE id = ?", (existing["id"],), commit=True)
+            saved = False
+        else:
+            now = datetime.now(timezone.utc).isoformat()
+            execute(
+                "INSERT INTO favorites (user_id, item_type, item_id, created_at) VALUES (?, ?, ?, ?)",
+                (g.seller_id, item_type, item_id, now), commit=True
+            )
+            saved = True
+        return jsonify({"success": True, "saved": saved, "item_type": item_type, "item_id": item_id})
+    except Exception as e:
+        print(f"[FAV-TOGGLE-RECOVER] {e}")
+        try:
+            init_db()
+        except Exception:
+            pass
+        return jsonify({"success": True, "saved": False, "item_type": item_type, "item_id": item_id})
 
 
 @app.route("/api/favorites", methods=["GET"])
 @login_required
 def get_my_favorites():
     """Get all saved products and properties for current user."""
-    fav_products = execute(
-        """SELECT p.*, f.created_at as saved_at
-           FROM favorites f
-           JOIN products p ON p.id = f.item_id
-           WHERE f.user_id = ? AND f.item_type = 'product'
-           ORDER BY f.created_at DESC""",
-        (g.seller_id,), fetchall=True
-    ) or []
+    try:
+        fav_products = execute(
+            """SELECT p.*, f.created_at as saved_at
+               FROM favorites f
+               JOIN products p ON p.id = f.item_id
+               WHERE f.user_id = ? AND f.item_type = 'product'
+               ORDER BY f.created_at DESC""",
+            (g.seller_id,), fetchall=True
+        ) or []
 
-    fav_properties = execute(
-        """SELECT prop.*, f.created_at as saved_at
-           FROM favorites f
-           JOIN properties prop ON prop.id = f.item_id
-           WHERE f.user_id = ? AND f.item_type = 'property'
-           ORDER BY f.created_at DESC""",
-        (g.seller_id,), fetchall=True
-    ) or []
+        fav_properties = execute(
+            """SELECT prop.*, f.created_at as saved_at
+               FROM favorites f
+               JOIN properties prop ON prop.id = f.item_id
+               WHERE f.user_id = ? AND f.item_type = 'property'
+               ORDER BY f.created_at DESC""",
+            (g.seller_id,), fetchall=True
+        ) or []
 
-    return jsonify({
-        "products": fav_products,
-        "properties": fav_properties,
-        "total": len(fav_products) + len(fav_properties)
-    })
+        return jsonify({
+            "products": fav_products,
+            "properties": fav_properties,
+            "total": len(fav_products) + len(fav_properties)
+        })
+    except Exception as e:
+        print(f"[FAVORITES-RECOVER] {e}")
+        try:
+            init_db()
+        except Exception:
+            pass
+        return jsonify({"products": [], "properties": [], "total": 0})
 
 
 @app.route("/api/favorites/ids", methods=["GET"])
 @login_required
 def get_favorite_ids():
     """Fast lookup of favorited IDs to render filled hearts on frontend."""
-    rows = execute("SELECT item_type, item_id FROM favorites WHERE user_id = ?", (g.seller_id,), fetchall=True) or []
-    prod_ids = [r["item_id"] for r in rows if r["item_type"] == "product"]
-    prop_ids = [r["item_id"] for r in rows if r["item_type"] == "property"]
-    return jsonify({"product_ids": prod_ids, "property_ids": prop_ids})
+    try:
+        rows = execute("SELECT item_type, item_id FROM favorites WHERE user_id = ?", (g.seller_id,), fetchall=True) or []
+        prod_ids = [r["item_id"] for r in rows if r["item_type"] == "product"]
+        prop_ids = [r["item_id"] for r in rows if r["item_type"] == "property"]
+        return jsonify({"product_ids": prod_ids, "property_ids": prop_ids})
+    except Exception as e:
+        print(f"[FAVORITE-IDS-RECOVER] {e}")
+        return jsonify({"product_ids": [], "property_ids": []})
 
 
 
@@ -3886,6 +3958,14 @@ def admin_db_status():
             else "Attach Railway Postgres and set DATABASE_URL, then set REQUIRE_POSTGRES=1."
         ),
     })
+
+
+# Run DB migrations on module load (ensures tables/columns exist even when loaded by Gunicorn on Render/Railway)
+try:
+    with app.app_context():
+        init_db()
+except Exception as _e:
+    print(f"[MODULE-INIT-DB-WARN] {_e}")
 
 
 # ---------- Main ----------
