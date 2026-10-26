@@ -391,6 +391,25 @@ def init_db():
     except Exception as e:
         print(f"Paystack settings note: {e}")
 
+    # Default SMS & OTP settings (Ghana & Global)
+    try:
+        sms_defaults = [
+            ("sms_provider", "auto"),
+            ("sms_sender_id", "SunGarland"),
+            ("arkesel_api_key", ""),
+            ("hubtel_client_id", ""),
+            ("hubtel_client_secret", ""),
+            ("mnotify_api_key", ""),
+            ("twilio_account_sid", ""),
+            ("twilio_auth_token", ""),
+            ("twilio_from_number", ""),
+        ]
+        for skey, sval in sms_defaults:
+            if not execute("SELECT key FROM settings WHERE key = ?", (skey,), fetchone=True):
+                execute("INSERT INTO settings (key, value) VALUES (?, ?)", (skey, sval), commit=True)
+    except Exception as e:
+        print(f"SMS settings note: {e}")
+
     
     # Houses & Hostels (no online payment)
     try:
@@ -438,6 +457,7 @@ def init_db():
     try:
         auth_cols = [
             ("email_verified", "INTEGER DEFAULT 0"),
+            ("phone_verified", "INTEGER DEFAULT 0"),
             ("verification_token", "TEXT"),
             ("reset_token", "TEXT"),
             ("reset_token_expires", "TEXT"),
@@ -639,6 +659,77 @@ def init_db():
             """, commit=True)
     except Exception as e:
         print(f"Reports table note: {e}")
+
+    # OTPs, Follows, and Favorites tables
+    try:
+        if USE_POSTGRES:
+            execute("""
+                CREATE TABLE IF NOT EXISTS otps (
+                    id SERIAL PRIMARY KEY,
+                    identifier TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    code_hash TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    attempts INTEGER DEFAULT 0,
+                    is_verified INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """, commit=True)
+            execute("""
+                CREATE TABLE IF NOT EXISTS follows (
+                    id SERIAL PRIMARY KEY,
+                    follower_id INTEGER REFERENCES sellers(id) ON DELETE CASCADE,
+                    seller_id INTEGER REFERENCES sellers(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (follower_id, seller_id)
+                )
+            """, commit=True)
+            execute("""
+                CREATE TABLE IF NOT EXISTS favorites (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES sellers(id) ON DELETE CASCADE,
+                    item_type TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (user_id, item_type, item_id)
+                )
+            """, commit=True)
+        else:
+            execute("""
+                CREATE TABLE IF NOT EXISTS otps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    identifier TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    code_hash TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    attempts INTEGER DEFAULT 0,
+                    is_verified INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """, commit=True)
+            execute("""
+                CREATE TABLE IF NOT EXISTS follows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    follower_id INTEGER NOT NULL,
+                    seller_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (follower_id, seller_id)
+                )
+            """, commit=True)
+            execute("""
+                CREATE TABLE IF NOT EXISTS favorites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    item_type TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (user_id, item_type, item_id)
+                )
+            """, commit=True)
+    except Exception as e:
+        print(f"OTPs / Follows / Favorites table note: {e}")
 
     count_row = execute("SELECT COUNT(*) as cnt FROM products", fetchone=True)
     count = count_row["cnt"] if count_row else 0
@@ -911,6 +1002,208 @@ def login_required(f):
     return decorated
 
 
+def get_current_user_id():
+    """Extract seller_id from optional Authorization header, or None."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        data = decode_token(token)
+        if data:
+            return data.get("seller_id")
+    return None
+
+
+def normalize_ghana_phone(phone: str) -> str:
+    """Normalize phone number to international Ghana format without '+' (e.g. 233241234567)."""
+    if not phone:
+        return ""
+    digits = "".join(c for c in str(phone) if c.isdigit())
+    if digits.startswith("0") and len(digits) == 10:
+        return "233" + digits[1:]
+    if digits.startswith("00233"):
+        return digits[2:]
+    if digits.startswith("233") and len(digits) == 12:
+        return digits
+    return digits
+
+
+def send_sms_ghana(phone: str, message: str) -> dict:
+    """
+    Send SMS to Ghana phone number.
+    Supports Arkesel, Hubtel, mNotify, Twilio, and console Dev Mode fallback.
+    """
+    norm_phone = normalize_ghana_phone(phone)
+    if not norm_phone or len(norm_phone) < 9:
+        return {"success": False, "error": "Invalid phone number"}
+
+    provider = (get_setting("sms_provider") or os.environ.get("SMS_PROVIDER", "auto")).strip().lower()
+    sender_id = get_setting("sms_sender_id") or os.environ.get("SMS_SENDER_ID", "SunGarland")
+
+    arkesel_key = get_setting("arkesel_api_key") or os.environ.get("ARKESEL_API_KEY", "")
+    hubtel_client_id = get_setting("hubtel_client_id") or os.environ.get("HUBTEL_CLIENT_ID", "")
+    hubtel_client_secret = get_setting("hubtel_client_secret") or os.environ.get("HUBTEL_CLIENT_SECRET", "")
+    mnotify_key = get_setting("mnotify_api_key") or os.environ.get("MNOTIFY_API_KEY", "")
+    twilio_sid = get_setting("twilio_account_sid") or os.environ.get("TWILIO_ACCOUNT_SID", "")
+    twilio_token = get_setting("twilio_auth_token") or os.environ.get("TWILIO_AUTH_TOKEN", "")
+    twilio_from = get_setting("twilio_from_number") or os.environ.get("TWILIO_FROM_NUMBER", "")
+
+    # Auto detect provider
+    if provider == "auto" or not provider:
+        if arkesel_key:
+            provider = "arkesel"
+        elif hubtel_client_id and hubtel_client_secret:
+            provider = "hubtel"
+        elif mnotify_key:
+            provider = "mnotify"
+        elif twilio_sid and twilio_token:
+            provider = "twilio"
+        else:
+            provider = "dev"
+
+    if provider == "arkesel":
+        try:
+            res = requests.post(
+                "https://sms.arkesel.com/api/v2/sms/send",
+                headers={"api-key": arkesel_key},
+                json={
+                    "sender": sender_id[:11],
+                    "recipients": [norm_phone],
+                    "message": message,
+                },
+                timeout=12,
+            )
+            ok = res.status_code in (200, 201)
+            return {"success": ok, "provider": "arkesel", "response": res.text}
+        except Exception as e:
+            print(f"[SMS-ARKESEL-ERROR] {e}")
+            return {"success": False, "error": str(e)}
+
+    elif provider == "hubtel":
+        try:
+            res = requests.post(
+                "https://smsc.hubtel.com/v1/messages/send",
+                auth=(hubtel_client_id, hubtel_client_secret),
+                json={
+                    "From": sender_id[:11],
+                    "To": norm_phone,
+                    "Content": message,
+                },
+                timeout=12,
+            )
+            ok = res.status_code in (200, 201)
+            return {"success": ok, "provider": "hubtel", "response": res.text}
+        except Exception as e:
+            print(f"[SMS-HUBTEL-ERROR] {e}")
+            return {"success": False, "error": str(e)}
+
+    elif provider == "mnotify":
+        try:
+            res = requests.post(
+                "https://api.mnotify.com/api/sms/quick",
+                headers={"key": mnotify_key},
+                json={
+                    "recipient": [norm_phone],
+                    "sender": sender_id[:11],
+                    "message": message,
+                },
+                timeout=12,
+            )
+            ok = res.status_code in (200, 201)
+            return {"success": ok, "provider": "mnotify", "response": res.text}
+        except Exception as e:
+            print(f"[SMS-MNOTIFY-ERROR] {e}")
+            return {"success": False, "error": str(e)}
+
+    elif provider == "twilio":
+        try:
+            res = requests.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json",
+                auth=(twilio_sid, twilio_token),
+                data={"From": twilio_from, "To": "+" + norm_phone, "Body": message},
+                timeout=12,
+            )
+            ok = res.status_code in (200, 201)
+            return {"success": ok, "provider": "twilio", "response": res.text}
+        except Exception as e:
+            print(f"[SMS-TWILIO-ERROR] {e}")
+            return {"success": False, "error": str(e)}
+
+    else:
+        # Dev mode fallback
+        print("\n" + "=" * 45)
+        print(f"[SMS-DEV] Ghana Recipient: +{norm_phone}")
+        print(f"[SMS-DEV] Message:\n{message}")
+        print("=" * 45 + "\n")
+        return {"success": True, "provider": "dev", "dev_mode": True}
+
+
+def generate_and_save_otp(identifier: str, channel: str, purpose: str) -> tuple[str, bool]:
+    """Generates a 6-digit OTP code and records it. Returns (code, is_rate_limited)."""
+    now = datetime.now(timezone.utc)
+    recent = execute(
+        "SELECT id, created_at FROM otps WHERE identifier = ? AND purpose = ? ORDER BY id DESC LIMIT 1",
+        (identifier, purpose),
+        fetchone=True
+    )
+    if recent:
+        try:
+            created_dt = datetime.fromisoformat(recent["created_at"].replace("Z", "+00:00"))
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            if (now - created_dt).total_seconds() < 60:
+                return "", True
+        except Exception:
+            pass
+
+    code = f"{pysecrets.randbelow(900000) + 100000}"
+    code_hash = hashlib.sha256(code.encode()).hexdigest()
+    expires_at = (now + timedelta(minutes=10)).isoformat()
+    created_at = now.isoformat()
+
+    execute(
+        """INSERT INTO otps (identifier, channel, code_hash, purpose, expires_at, attempts, is_verified, created_at)
+           VALUES (?, ?, ?, ?, ?, 0, 0, ?)""",
+        (identifier, channel, code_hash, purpose, expires_at, created_at),
+        commit=True
+    )
+    return code, False
+
+
+def verify_otp_code(identifier: str, purpose: str, code: str) -> tuple[bool, str]:
+    """Verifies a 6-digit OTP code against the latest valid token."""
+    now = datetime.now(timezone.utc)
+    row = execute(
+        """SELECT id, code_hash, expires_at, attempts, is_verified
+           FROM otps WHERE identifier = ? AND purpose = ? AND is_verified = 0
+           ORDER BY id DESC LIMIT 1""",
+        (identifier, purpose),
+        fetchone=True
+    )
+    if not row:
+        return False, "No active verification code found. Please request a new code."
+
+    if (row["attempts"] or 0) >= 5:
+        return False, "Too many failed attempts. Please request a new code."
+
+    try:
+        exp_dt = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        if exp_dt < now:
+            return False, "Verification code has expired. Please request a new code."
+    except Exception:
+        return False, "Invalid code expiration."
+
+    input_hash = hashlib.sha256(str(code).strip().encode()).hexdigest()
+    if input_hash != row["code_hash"]:
+        execute("UPDATE otps SET attempts = attempts + 1 WHERE id = ?", (row["id"],), commit=True)
+        rem = 4 - (row["attempts"] or 0)
+        return False, f"Incorrect code. {max(0, rem)} attempt(s) remaining."
+
+    execute("UPDATE otps SET is_verified = 1 WHERE id = ?", (row["id"],), commit=True)
+    return True, ""
+
+
 # ---------- Auth Routes ----------
 
 @app.route("/api/auth/register", methods=["POST"])
@@ -928,7 +1221,7 @@ def register():
     email = data["email"].strip().lower()
     password = data["password"]
     shop_name = data["shop_name"].strip()
-    whatsapp = "".join(c for c in str(data["whatsapp"]) if c.isdigit())
+    whatsapp = normalize_ghana_phone(data["whatsapp"])
 
     if len(password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
@@ -988,6 +1281,7 @@ def register():
             "whatsapp": whatsapp,
             "subscription_expires_at": trial_end,
             "email_verified": False,
+            "phone_verified": False,
         },
         "message": "Account created. Please verify your email.",
     }
@@ -1064,6 +1358,7 @@ def login():
             "shop_name": seller["shop_name"],
             "whatsapp": seller["whatsapp"],
             "email_verified": bool(seller.get("email_verified")),
+            "phone_verified": bool(seller.get("phone_verified")),
             "full_name_profile": seller.get("full_name_profile"),
             "bio": seller.get("bio"),
             "profile_image": seller.get("profile_image"),
@@ -1076,7 +1371,7 @@ def login():
 def me():
     seller = execute(
         """SELECT id, username, email, shop_name, whatsapp, subscription_expires_at, kyc_status,
-                  email_verified, full_name_profile, bio, profile_image, created_at
+                  email_verified, phone_verified, full_name_profile, bio, profile_image, created_at
            FROM sellers WHERE id = ?""",
         (g.seller_id,),
         fetchone=True,
@@ -1085,6 +1380,7 @@ def me():
         return jsonify({"error": "Seller not found"}), 404
     result = dict(seller)
     result["email_verified"] = bool(result.get("email_verified"))
+    result["phone_verified"] = bool(result.get("phone_verified"))
     return jsonify(result)
 
 
@@ -1292,6 +1588,357 @@ def delete_account():
     execute("DELETE FROM properties WHERE seller_id = ?", (sid,), commit=True)
     execute("DELETE FROM sellers WHERE id = ?", (sid,), commit=True)
     return jsonify({"message": "Account and associated listings permanently deleted"})
+
+
+# ---------- OTP API Routes (Ghana SMS & Email) ----------
+
+@app.route("/api/otp/send", methods=["POST"])
+def otp_send():
+    """
+    Send OTP code via SMS or Email.
+    Payload: { "identifier": "024XXXXXXX" or "email@example.com", "channel": "sms" | "email", "purpose": "..." }
+    """
+    data = request.get_json(silent=True) or {}
+    raw_ident = (data.get("identifier") or "").strip()
+    channel = (data.get("channel") or "").strip().lower()
+    purpose = (data.get("purpose") or "verification").strip().lower()
+
+    if not raw_ident:
+        return jsonify({"error": "Phone number or email required"}), 400
+
+    # Auto-detect channel if omitted
+    if not channel:
+        channel = "email" if "@" in raw_ident else "sms"
+
+    if channel == "sms":
+        ident = normalize_ghana_phone(raw_ident)
+        if len(ident) < 9:
+            return jsonify({"error": "Invalid Ghana phone number. Example: 0241234567"}), 400
+    else:
+        ident = raw_ident.lower()
+        if "@" not in ident or "." not in ident.split("@")[-1]:
+            return jsonify({"error": "Invalid email address"}), 400
+
+    code, rate_limited = generate_and_save_otp(ident, channel, purpose)
+    if rate_limited:
+        return jsonify({"error": "Please wait 60 seconds before requesting another code."}), 429
+
+    msg_text = f"Your SunGarland verification code is {code}. Valid for 10 minutes. Do not share this code."
+
+    dev_mode = False
+    if channel == "sms":
+        sms_res = send_sms_ghana(ident, msg_text)
+        dev_mode = sms_res.get("dev_mode", False) or not sms_res.get("success", False)
+    else:
+        sent = send_email(ident, "SunGarland Verification Code", f"Hello,\n\n{msg_text}\n\n- The SunGarland Team")
+        dev_mode = not sent
+
+    resp = {
+        "success": True,
+        "message": f"Verification code sent via {channel.upper()}",
+        "channel": channel,
+        "identifier": ident,
+        "purpose": purpose,
+    }
+    if dev_mode:
+        resp["dev_code"] = code
+
+    return jsonify(resp)
+
+
+@app.route("/api/otp/verify", methods=["POST"])
+def otp_verify():
+    """
+    Verify OTP code.
+    Payload: { "identifier": "...", "code": "...", "purpose": "..." }
+    """
+    data = request.get_json(silent=True) or {}
+    raw_ident = (data.get("identifier") or "").strip()
+    code = (data.get("code") or "").strip()
+    purpose = (data.get("purpose") or "verification").strip().lower()
+
+    if not raw_ident or not code:
+        return jsonify({"error": "Identifier and code required"}), 400
+
+    ident = normalize_ghana_phone(raw_ident) if "@" not in raw_ident else raw_ident.lower()
+
+    valid, err_msg = verify_otp_code(ident, purpose, code)
+    if not valid:
+        return jsonify({"error": err_msg}), 400
+
+    # Auto-link if logged in or specific purpose
+    current_uid = get_current_user_id()
+    if purpose == "verify_phone":
+        if current_uid:
+            execute(
+                "UPDATE sellers SET phone_verified = 1, whatsapp = ? WHERE id = ?",
+                (ident, current_uid), commit=True
+            )
+            create_notification(current_uid, "Phone Verified ✅", "Your Ghana phone number has been verified.")
+    elif purpose == "verify_email":
+        if current_uid:
+            execute("UPDATE sellers SET email_verified = 1 WHERE id = ?", (current_uid,), commit=True)
+            create_notification(current_uid, "Email Verified ✅", "Your email address has been verified.")
+
+    return jsonify({
+        "success": True,
+        "message": "Verification successful!",
+        "identifier": ident,
+        "purpose": purpose,
+    })
+
+
+@app.route("/api/auth/phone-login-otp", methods=["POST"])
+def phone_login_otp():
+    """
+    Passwordless login via Ghana phone OTP.
+    Step 1 (action='request'): sends code to WhatsApp/phone.
+    Step 2 (action='verify'): verifies code and returns JWT token!
+    """
+    data = request.get_json(silent=True) or {}
+    raw_phone = (data.get("phone") or "").strip()
+    action = (data.get("action") or "request").strip().lower()
+    phone = normalize_ghana_phone(raw_phone)
+
+    if len(phone) < 9:
+        return jsonify({"error": "Invalid Ghana phone number. Example: 0241234567"}), 400
+
+    seller = execute(
+        "SELECT * FROM sellers WHERE whatsapp = ? OR whatsapp = ? OR whatsapp = ?",
+        (phone, raw_phone, "0" + phone[3:] if phone.startswith("233") else phone),
+        fetchone=True
+    )
+    if not seller:
+        return jsonify({"error": "No account found with this phone number. Please register first."}), 404
+
+    if seller.get("is_blocked"):
+        return jsonify({"error": "Your account has been blocked. Please contact support."}), 403
+
+    if action == "request":
+        code, rate_limited = generate_and_save_otp(phone, "sms", "login")
+        if rate_limited:
+            return jsonify({"error": "Please wait 60 seconds before requesting another code."}), 429
+        sms_res = send_sms_ghana(phone, f"Your SunGarland login code is {code}. Valid for 10 minutes.")
+        resp = {"success": True, "message": "Login code sent to your phone", "phone": phone}
+        if sms_res.get("dev_mode", False) or not sms_res.get("success", False):
+            resp["dev_code"] = code
+        return jsonify(resp)
+
+    elif action == "verify":
+        code = (data.get("code") or "").strip()
+        if not code:
+            return jsonify({"error": "OTP code is required"}), 400
+        valid, err_msg = verify_otp_code(phone, "login", code)
+        if not valid:
+            return jsonify({"error": err_msg}), 400
+
+        # Login successful! Reset failed attempts
+        execute("UPDATE sellers SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?", (seller["id"],), commit=True)
+        token = create_token(seller["id"], seller["username"])
+        return jsonify({
+            "token": token,
+            "seller": {
+                "id": seller["id"],
+                "username": seller["username"],
+                "email": seller["email"],
+                "shop_name": seller["shop_name"],
+                "whatsapp": seller["whatsapp"],
+                "email_verified": bool(seller.get("email_verified")),
+                "phone_verified": bool(seller.get("phone_verified")),
+                "full_name_profile": seller.get("full_name_profile"),
+                "bio": seller.get("bio"),
+                "profile_image": seller.get("profile_image"),
+            }
+        })
+    else:
+        return jsonify({"error": "Invalid action. Use 'request' or 'verify'."}), 400
+
+
+# ---------- Follow / Unfollow System ----------
+
+@app.route("/api/sellers/<int:seller_id>/follow", methods=["POST"])
+@login_required
+def toggle_follow_seller(seller_id):
+    """Toggle follow/unfollow a seller shop."""
+    if seller_id == g.seller_id:
+        return jsonify({"error": "You cannot follow your own shop"}), 400
+
+    target = execute("SELECT id, shop_name, username FROM sellers WHERE id = ?", (seller_id,), fetchone=True)
+    if not target:
+        return jsonify({"error": "Seller not found"}), 404
+
+    existing = execute(
+        "SELECT id FROM follows WHERE follower_id = ? AND seller_id = ?",
+        (g.seller_id, seller_id), fetchone=True
+    )
+
+    follower = execute("SELECT id, username, shop_name FROM sellers WHERE id = ?", (g.seller_id,), fetchone=True)
+    follower_name = follower["shop_name"] if follower else g.username
+
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        execute("DELETE FROM follows WHERE id = ?", (existing["id"],), commit=True)
+        following = False
+        message = f"Unfollowed {target['shop_name']}"
+    else:
+        execute(
+            "INSERT INTO follows (follower_id, seller_id, created_at) VALUES (?, ?, ?)",
+            (g.seller_id, seller_id, now), commit=True
+        )
+        following = True
+        message = f"You are now following {target['shop_name']}!"
+        # Create notification for the seller
+        create_notification(
+            seller_id,
+            "New Follower! 🎉",
+            f"{follower_name} started following your shop.",
+            f"/?seller={g.seller_id}"
+        )
+
+    count_row = execute("SELECT COUNT(*) as cnt FROM follows WHERE seller_id = ?", (seller_id,), fetchone=True)
+    followers_count = count_row["cnt"] if count_row else 0
+
+    return jsonify({
+        "success": True,
+        "following": following,
+        "followers_count": followers_count,
+        "message": message,
+    })
+
+
+@app.route("/api/sellers/<int:seller_id>/follow-status", methods=["GET"])
+def get_follow_status(seller_id):
+    """Returns follower count and whether requester is following."""
+    count_row = execute("SELECT COUNT(*) as cnt FROM follows WHERE seller_id = ?", (seller_id,), fetchone=True)
+    followers_count = count_row["cnt"] if count_row else 0
+
+    uid = get_current_user_id()
+    following = False
+    if uid:
+        row = execute("SELECT id FROM follows WHERE follower_id = ? AND seller_id = ?", (uid, seller_id), fetchone=True)
+        following = bool(row)
+
+    return jsonify({
+        "seller_id": seller_id,
+        "following": following,
+        "followers_count": followers_count,
+    })
+
+
+@app.route("/api/sellers/<int:seller_id>/followers", methods=["GET"])
+def get_seller_followers(seller_id):
+    """Get list of followers for a shop."""
+    rows = execute(
+        """SELECT s.id, s.username, s.shop_name, s.profile_image, f.created_at
+           FROM follows f
+           JOIN sellers s ON s.id = f.follower_id
+           WHERE f.seller_id = ?
+           ORDER BY f.created_at DESC""",
+        (seller_id,), fetchall=True
+    ) or []
+    return jsonify(rows)
+
+
+@app.route("/api/my/following", methods=["GET"])
+@login_required
+def get_my_following():
+    """List of sellers the current logged-in user is following."""
+    rows = execute(
+        """SELECT s.id, s.username, s.shop_name, s.whatsapp, s.profile_image, s.kyc_status, f.created_at
+           FROM follows f
+           JOIN sellers s ON s.id = f.seller_id
+           WHERE f.follower_id = ?
+           ORDER BY f.created_at DESC""",
+        (g.seller_id,), fetchall=True
+    ) or []
+    return jsonify(rows)
+
+
+@app.route("/api/feed/following", methods=["GET"])
+@login_required
+def get_following_feed():
+    """Returns product feed exclusively from sellers the user follows."""
+    rows = execute(
+        """SELECT p.*, s.shop_name as seller_shop, s.username as seller_username
+           FROM products p
+           JOIN follows f ON f.seller_id = p.seller_id
+           JOIN sellers s ON s.id = p.seller_id
+           WHERE f.follower_id = ?
+           ORDER BY p.created_at DESC
+           LIMIT 50""",
+        (g.seller_id,), fetchall=True
+    ) or []
+    return jsonify(rows)
+
+
+# ---------- Favorites / Wishlist System ----------
+
+@app.route("/api/favorites/toggle", methods=["POST"])
+@login_required
+def toggle_favorite():
+    """Toggle saving a product or property to wishlist."""
+    data = request.get_json(silent=True) or {}
+    item_type = (data.get("item_type") or "product").strip().lower()
+    try:
+        item_id = int(data.get("item_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Valid item_id required"}), 400
+
+    existing = execute(
+        "SELECT id FROM favorites WHERE user_id = ? AND item_type = ? AND item_id = ?",
+        (g.seller_id, item_type, item_id), fetchone=True
+    )
+    if existing:
+        execute("DELETE FROM favorites WHERE id = ?", (existing["id"],), commit=True)
+        saved = False
+    else:
+        now = datetime.now(timezone.utc).isoformat()
+        execute(
+            "INSERT INTO favorites (user_id, item_type, item_id, created_at) VALUES (?, ?, ?, ?)",
+            (g.seller_id, item_type, item_id, now), commit=True
+        )
+        saved = True
+
+    return jsonify({"success": True, "saved": saved, "item_type": item_type, "item_id": item_id})
+
+
+@app.route("/api/favorites", methods=["GET"])
+@login_required
+def get_my_favorites():
+    """Get all saved products and properties for current user."""
+    fav_products = execute(
+        """SELECT p.*, f.created_at as saved_at
+           FROM favorites f
+           JOIN products p ON p.id = f.item_id
+           WHERE f.user_id = ? AND f.item_type = 'product'
+           ORDER BY f.created_at DESC""",
+        (g.seller_id,), fetchall=True
+    ) or []
+
+    fav_properties = execute(
+        """SELECT prop.*, f.created_at as saved_at
+           FROM favorites f
+           JOIN properties prop ON prop.id = f.item_id
+           WHERE f.user_id = ? AND f.item_type = 'property'
+           ORDER BY f.created_at DESC""",
+        (g.seller_id,), fetchall=True
+    ) or []
+
+    return jsonify({
+        "products": fav_products,
+        "properties": fav_properties,
+        "total": len(fav_products) + len(fav_properties)
+    })
+
+
+@app.route("/api/favorites/ids", methods=["GET"])
+@login_required
+def get_favorite_ids():
+    """Fast lookup of favorited IDs to render filled hearts on frontend."""
+    rows = execute("SELECT item_type, item_id FROM favorites WHERE user_id = ?", (g.seller_id,), fetchall=True) or []
+    prod_ids = [r["item_id"] for r in rows if r["item_type"] == "product"]
+    prop_ids = [r["item_id"] for r in rows if r["item_type"] == "property"]
+    return jsonify({"product_ids": prod_ids, "property_ids": prop_ids})
 
 
 
@@ -1951,7 +2598,9 @@ def product_details(product_id):
 @app.route("/api/sellers/<int:seller_id>", methods=["GET"])
 def seller_profile(seller_id):
     seller = execute(
-        "SELECT id, username, shop_name, whatsapp, kyc_status, created_at FROM sellers WHERE id = ?",
+        """SELECT id, username, shop_name, whatsapp, kyc_status, phone_verified, email_verified,
+                  full_name_profile, bio, profile_image, created_at
+           FROM sellers WHERE id = ?""",
         (seller_id,), fetchone=True
     )
     if not seller:
@@ -1961,6 +2610,16 @@ def seller_profile(seller_id):
         "SELECT * FROM products WHERE seller_id = ? ORDER BY created_at DESC",
         (seller_id,), fetchall=True
     ) or []
+
+    # Follower count & following status
+    cnt_row = execute("SELECT COUNT(*) as cnt FROM follows WHERE seller_id = ?", (seller_id,), fetchone=True)
+    followers_count = cnt_row["cnt"] if cnt_row else 0
+
+    uid = get_current_user_id()
+    is_following = False
+    if uid:
+        f_row = execute("SELECT id FROM follows WHERE follower_id = ? AND seller_id = ?", (uid, seller_id), fetchone=True)
+        is_following = bool(f_row)
 
     # Average rating across all their products
     avg_row = execute(
@@ -1974,6 +2633,10 @@ def seller_profile(seller_id):
     result = dict(seller)
     result["products"] = products
     result["product_count"] = len(products)
+    result["followers_count"] = followers_count
+    result["is_following"] = is_following
+    result["phone_verified"] = bool(result.get("phone_verified"))
+    result["email_verified"] = bool(result.get("email_verified"))
     result["average_rating"] = round(float(avg_row["avg_rating"] or 0), 1) if avg_row else 0
     result["rating_count"] = avg_row["rating_count"] if avg_row else 0
     return jsonify(result)
@@ -2302,6 +2965,15 @@ def admin_get_settings():
         "cloudinary_cloud_name": get_setting("cloudinary_cloud_name", ""),
         "cloudinary_api_key": get_setting("cloudinary_api_key", ""),
         "cloudinary_api_secret": get_setting("cloudinary_api_secret", ""),
+        "sms_provider": get_setting("sms_provider", "auto"),
+        "sms_sender_id": get_setting("sms_sender_id", "SunGarland"),
+        "arkesel_api_key": get_setting("arkesel_api_key", ""),
+        "hubtel_client_id": get_setting("hubtel_client_id", ""),
+        "hubtel_client_secret": get_setting("hubtel_client_secret", ""),
+        "mnotify_api_key": get_setting("mnotify_api_key", ""),
+        "twilio_account_sid": get_setting("twilio_account_sid", ""),
+        "twilio_auth_token": get_setting("twilio_auth_token", ""),
+        "twilio_from_number": get_setting("twilio_from_number", ""),
         "smtp_configured": bool(os.environ.get("SMTP_HOST")),
         "frontend_url": frontend_base_url(),
     })
@@ -2344,6 +3016,14 @@ def admin_update_settings():
         set_setting("cloudinary_api_key", str(data["cloudinary_api_key"]).strip())
     if "cloudinary_api_secret" in data:
         set_setting("cloudinary_api_secret", str(data["cloudinary_api_secret"]).strip())
+
+    for key in [
+        "sms_provider", "sms_sender_id", "arkesel_api_key", "hubtel_client_id",
+        "hubtel_client_secret", "mnotify_api_key", "twilio_account_sid",
+        "twilio_auth_token", "twilio_from_number"
+    ]:
+        if key in data:
+            set_setting(key, str(data[key]).strip())
 
     return jsonify({
         "message": "Settings updated",
@@ -3209,8 +3889,6 @@ def admin_db_status():
 
 
 # ---------- Main ----------
-with app.app_context():
-    init_db()
 if __name__ == "__main__":
     with app.app_context():
         init_db()
